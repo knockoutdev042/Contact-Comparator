@@ -23,6 +23,8 @@ from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
+from auth import render_logout_button, require_login
+
 # ── Normalization Helpers ─────────────────────────────────
 
 
@@ -223,15 +225,96 @@ def run_extraction(contact_files, sf_file, log):
     }
 
 
+# ── Styling ────────────────────────────────────
+
+STYLE = """
+<style>
+.ece-banner {
+    background: #16213e;
+    border-radius: 14px;
+    padding: 22px 28px;
+    margin-bottom: 22px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+}
+.ece-banner .ece-icon { font-size: 2.2rem; line-height: 1; }
+.ece-banner .ece-title { color: #e94560; font-size: 1.5rem; font-weight: 700; letter-spacing: .01em; }
+.ece-banner .ece-subtitle { color: #a0a0c0; font-size: 0.88rem; margin-top: 3px; }
+
+.stat-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 14px;
+    margin: 14px 0 22px;
+}
+@media (max-width: 900px) {
+    .stat-grid { grid-template-columns: repeat(2, 1fr); }
+}
+.stat-card {
+    border-radius: 12px;
+    padding: 16px 18px;
+    border: 1px solid rgba(11,11,11,0.10);
+    border-left: 4px solid #2a78d6;
+    background: #fcfcfb;
+}
+.stat-card .stat-icon { font-size: 1.3rem; }
+.stat-card .stat-label {
+    font-size: 0.78rem;
+    color: #52514e;
+    margin-top: 6px;
+    font-weight: 600;
+    letter-spacing: .03em;
+    text-transform: uppercase;
+}
+.stat-card .stat-value { font-size: 1.9rem; font-weight: 700; color: #0b0b0b; margin-top: 2px; }
+.stat-card.role-good { border-left-color: #0ca30c; }
+.stat-card.role-serious { border-left-color: #ec835a; }
+.stat-card.role-accent { border-left-color: #e94560; }
+
+@media (prefers-color-scheme: dark) {
+    .stat-card { background: #1a1a19; border-color: rgba(255,255,255,0.10); }
+    .stat-card .stat-label { color: #c3c2b7; }
+    .stat-card .stat-value { color: #ffffff; }
+    .stat-card.role-neutral { border-left-color: #3987e5; }
+}
+</style>
+"""
+
+
+def stat_card(icon, label, value, role="neutral"):
+    return f"""
+    <div class="stat-card role-{role}">
+        <div class="stat-icon">{icon}</div>
+        <div class="stat-label">{label}</div>
+        <div class="stat-value">{value}</div>
+    </div>
+    """
+
+
 # ── Streamlit UI ────────────────────────────────────
 
 st.set_page_config(page_title="Excluded Contacts Extractor", page_icon="📇", layout="wide")
 
-st.title("📇 Excluded Contacts Extractor")
-st.caption(
-    "Find Contact Us entries not present in Salesforce. "
-    "A contact is matched if its Email is found in Salesforce, "
-    "or — when no email is given — if its Phone is found instead."
+current_user = require_login()
+render_logout_button()
+
+st.markdown(STYLE, unsafe_allow_html=True)
+
+st.markdown(
+    """
+    <div class="ece-banner">
+        <div class="ece-icon">📇</div>
+        <div>
+            <div class="ece-title">Excluded Contacts Extractor</div>
+            <div class="ece-subtitle">
+                Find Contact Us entries not present in Salesforce. A contact is matched if its
+                Email is found in Salesforce, or — when no email is given — if its Phone is found instead.
+            </div>
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
 )
 
 col1, col2 = st.columns(2)
@@ -246,7 +329,7 @@ with col1:
     )
 
 with col2:
-    st.subheader("📂 Salesforce File")
+    st.subheader("🗂️ Salesforce File")
     sf_file = st.file_uploader(
         "Upload Salesforce file",
         type=["csv", "xlsx", "xls"],
@@ -256,7 +339,7 @@ with col2:
 
 with st.expander("⚙️ Options"):
     include_matched = st.checkbox(
-        "Include a 'Matched Contacts' sheet in the download",
+        "✅ Include a 'Matched Contacts' sheet in the download",
         value=False,
         help="The original tool only exported Excluded Contacts. "
         "Turn this on to also get a sheet of the rows that matched Salesforce.",
@@ -271,28 +354,32 @@ if run_clicked:
         logs.append(msg)
 
     if not contact_files:
-        st.warning("Please upload at least one Contact file.")
+        st.warning("⚠️ Please upload at least one Contact file.")
     elif not sf_file:
-        st.warning("Please upload a Salesforce file.")
+        st.warning("⚠️ Please upload a Salesforce file.")
     else:
         try:
             with st.spinner("Running extraction..."):
                 result = run_extraction(contact_files, sf_file, log)
         except Exception as e:
             st.error(f"❌ {e}")
-            with st.expander("Log"):
+            with st.expander("🧾 Log"):
                 st.text("\n".join(logs))
         else:
-            st.success("Extraction complete!")
+            st.success("✅ Extraction complete!")
 
             total = result["contact_total"]
             matched_pct = round((result["matched_count"] / total) * 100, 2) if total else 0
 
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Total Contact Rows", total)
-            c2.metric("Matched", result["matched_count"])
-            c3.metric("Excluded", result["excluded_count"])
-            c4.metric("Match Rate", f"{matched_pct}%")
+            st.markdown(
+                '<div class="stat-grid">'
+                + stat_card("📋", "Total Contact Rows", total, "neutral")
+                + stat_card("✅", "Matched", result["matched_count"], "good")
+                + stat_card("⚠️", "Excluded", result["excluded_count"], "serious")
+                + stat_card("🎯", "Match Rate", f"{matched_pct}%", "accent")
+                + "</div>",
+                unsafe_allow_html=True,
+            )
 
             sheets = {"Excluded Contacts": result["excluded"]}
             if include_matched:
@@ -312,7 +399,8 @@ if run_clicked:
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
-            tabs = st.tabs(["Excluded", "Matched", "Log"] if include_matched else ["Excluded", "Log"])
+            tab_labels = ["📋 Excluded", "✅ Matched", "🧾 Log"] if include_matched else ["📋 Excluded", "🧾 Log"]
+            tabs = st.tabs(tab_labels)
 
             with tabs[0]:
                 st.dataframe(result["excluded"].head(200), use_container_width=True)
