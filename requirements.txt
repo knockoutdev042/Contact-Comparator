@@ -1,6 +1,4 @@
-
-xlrd
+streamlit
 pandas
 openpyxl
-tkinter
-pyinstaller
+xlrd
