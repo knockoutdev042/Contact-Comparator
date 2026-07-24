@@ -1,13 +1,14 @@
 """
 app.py
 -------------------------
-Streamlit web app for the Data Comparison Tool (Contact vs Salesforce).
+Streamlit web app for the Excluded Contacts Extractor.
 
-This is a Streamlit port of comparator.py's core logic — matching,
-deduplication, unidirectional/bidirectional comparison, and the
-Campaign ID / AdGroup ID marketing filters, all producing the same
-multi-sheet Excel report. The Tkinter GUI is replaced by Streamlit
-widgets; the comparison logic itself is unchanged.
+Ports excluded_contacts_gui.py's core logic to the web: flexible
+phone/email column detection, email-priority matching against a
+Salesforce file (email checked first when present, phone as
+fallback), and a styled multi-sheet Excel export. The Tkinter GUI
+is replaced by Streamlit widgets; matching/normalization logic is
+unchanged from the original.
 
 Run locally:
     streamlit run app.py
@@ -18,507 +19,250 @@ import re
 
 import pandas as pd
 import streamlit as st
+from openpyxl import load_workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
 
-# ── File Reader ─────────────────────────────────
-
-
-def read_file(uploaded_file):
-    name = uploaded_file.name.lower()
-    try:
-        if name.endswith(".csv"):
-            try:
-                uploaded_file.seek(0)
-                return pd.read_csv(uploaded_file, encoding="utf-8-sig")
-            except Exception:
-                uploaded_file.seek(0)
-                return pd.read_csv(uploaded_file, encoding="latin1")
-        else:
-            uploaded_file.seek(0)
-            return pd.read_excel(uploaded_file, engine="openpyxl")
-    except Exception as e:
-        raise Exception(f"Error reading file: {uploaded_file.name}\n{e}")
-
-
-# ── Normalization ─────────────────────────────────
+# ── Normalization Helpers ─────────────────────────────────
 
 
 def normalize_phone(p):
     if pd.isna(p):
         return None
-    digits = re.sub(r"[^\d]", "", str(p))
-    if len(digits) == 11 and digits.startswith("1"):
-        digits = digits[1:]
-    return digits if len(digits) >= 7 else None
+
+    p = str(p)
+    p = re.sub(r"\s+", "", p)
+    p = p.replace("'", "")
+
+    try:
+        if "E+" in p.upper():
+            p = str(int(float(p)))
+    except Exception:
+        pass
+
+    digits = re.sub(r"\D", "", p)
+    return f"+{digits}" if digits else None
 
 
-def normalize_email(e):
-    return str(e).strip().lower() if pd.notna(e) else ""
+def normalize_email(email):
+    if pd.isna(email):
+        return None
+
+    email = str(email)
+    email = re.sub(r"\s+", "", email)
+    email = email.lower().strip()
+
+    return email if "@" in email else None
 
 
-def normalize_name(first, last):
-    return f"{str(first).strip()} {str(last).strip()}".strip()
+def find_column(df, possible_names):
+    for col in df.columns:
+        clean_col = col.strip().lower()
+        for name in possible_names:
+            if clean_col == name.strip().lower():
+                return col
+    return None
 
 
-# ── Deduplication ─────────────────────────────────
+PHONE_ALIASES = ["Phone", "Mobile", "Phone Number", "Contact Number"]
+EMAIL_ALIASES = ["Email", "Email Address", "E-mail"]
 
 
-def deduplicate(df, use_phone, use_email, use_name):
-    subset = []
-
-    if use_phone and "_phone" in df:
-        subset.append("_phone")
-    if use_email and "_email" in df:
-        subset.append("_email")
-    if use_name and "_name" in df:
-        subset.append("_name")
-
-    if subset:
-        df = df.drop_duplicates(subset=subset, keep="first")
-
-    return df
+def read_any(uploaded_file):
+    name = uploaded_file.name.lower()
+    uploaded_file.seek(0)
+    if name.endswith(".csv"):
+        try:
+            return pd.read_csv(uploaded_file, encoding="utf-8-sig")
+        except UnicodeDecodeError:
+            uploaded_file.seek(0)
+            return pd.read_csv(uploaded_file, encoding="latin1")
+    else:
+        return pd.read_excel(uploaded_file)
 
 
-# ── Match Key Builder ─────────────────────────────
+# ── Excel Styling ─────────────────────────────────
 
 
-def build_match_keys(df, use_phone, use_email, use_name):
-    keys = []
+def style_workbook(buffer):
+    buffer.seek(0)
+    wb = load_workbook(buffer)
 
-    if use_phone:
-        keys.append(df["_phone"].fillna(""))
+    for ws in wb.worksheets:
+        for cell in ws[1]:
+            cell.fill = PatternFill("solid", fgColor="C00000")
+            cell.font = Font(bold=True, color="FFFFFF", name="Calibri", size=10)
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
-    if use_email:
-        keys.append(df["_email"].fillna(""))
+        ws.row_dimensions[1].height = 30
 
-    if use_name:
-        keys.append(df["_name"].fillna(""))
+        for row in ws.iter_rows(min_row=2):
+            for cell in row:
+                cell.font = Font(name="Calibri", size=9)
 
-    if not keys:
-        raise Exception("Select at least one matching option")
+        ws.freeze_panes = "A2"
 
-    return pd.Series(list(zip(*keys)), index=df.index)
+        for col in ws.columns:
+            max_len = max((len(str(c.value)) if c.value else 0) for c in col)
+            ws.column_dimensions[get_column_letter(col[0].column)].width = min(max_len + 2, 40)
 
-
-# ── Marketing Analysis ─────────────────────────────
-
-
-def marketing_analysis(contact, sf, mode, direction, matched, excluded):
-    for col in ["Campaign ID", "AdGroup ID"]:
-        if col not in contact:
-            contact[col] = ""
-        if col not in sf:
-            sf[col] = ""
-
-    for df in [contact, sf]:
-        df["Campaign ID"] = df["Campaign ID"].fillna("").astype(str).str.strip()
-        df["AdGroup ID"] = df["AdGroup ID"].fillna("").astype(str).str.strip()
-
-    contact_cmp = contact[["key", "Campaign ID", "AdGroup ID"]].copy()
-    sf_cmp = sf[["key", "Campaign ID", "AdGroup ID"]].copy()
-
-    contact_cmp.columns = ["Key", "Contact Campaign", "Contact AdGroup"]
-    sf_cmp.columns = ["Key", "SF Campaign", "SF AdGroup"]
-
-    contact_cmp = contact_cmp[contact_cmp["Key"].astype(str).str.strip() != ""]
-    sf_cmp = sf_cmp[sf_cmp["Key"].astype(str).str.strip() != ""]
-
-    contact_cmp = contact_cmp.drop_duplicates(subset=["Key"])
-    sf_cmp = sf_cmp.drop_duplicates(subset=["Key"])
-
-    merged = pd.merge(contact_cmp, sf_cmp, on="Key", how="outer")
-
-    def campaign_status(row):
-        c = row["Contact Campaign"]
-        s = row["SF Campaign"]
-
-        if c and s:
-            return "Match" if c == s else "Different"
-        elif c and not s:
-            return "Missing in SF"
-        elif s and not c:
-            return "Missing in Contact"
-        return "Missing Both"
-
-    merged["Campaign Status"] = merged.apply(campaign_status, axis=1)
-
-    def adgroup_status(row):
-        c = row["Contact AdGroup"]
-        s = row["SF AdGroup"]
-
-        if c and s:
-            return "Match" if c == s else "Different"
-        elif c and not s:
-            return "Missing in SF"
-        elif s and not c:
-            return "Missing in Contact"
-        return "Missing Both"
-
-    merged["AdGroup Status"] = merged.apply(adgroup_status, axis=1)
-
-    contact_unique_keys = set(contact["key"])
-    sf_unique_keys = set(sf["key"])
-    total = len(contact_unique_keys.union(sf_unique_keys))
-
-    marketing_summary = pd.DataFrame(
-        {
-            "Metric": [
-                "Comparison Mode",
-                "Direction",
-                "Contact Records",
-                "SF Records",
-                "Total Unique Entities",
-                "Matched Unique Entities",
-                "Unmatched Unique Entities",
-                "Matched Rows",
-                "Excluded Rows",
-                "Contact Missing Records",
-                "SF Missing Records",
-                "Match Percentage",
-                "Missing Percentage",
-            ],
-            "Value": [
-                mode,
-                direction if mode == "UNIDIRECTIONAL" else "BOTH DIRECTIONS",
-                len(contact),
-                len(sf),
-                total,
-                len(set(contact["key"]).intersection(set(sf["key"]))),
-                len(set(contact["key"]).symmetric_difference(set(sf["key"]))),
-                len(matched),
-                len(excluded),
-                (
-                    len(excluded[excluded.get("Missing From", "") == "Salesforce"])
-                    if "Missing From" in excluded.columns
-                    else 0
-                ),
-                (
-                    len(excluded[excluded.get("Missing From", "") == "Contact"])
-                    if "Missing From" in excluded.columns
-                    else 0
-                ),
-                round(
-                    (len(set(contact["key"]).intersection(set(sf["key"]))) / total) * 100,
-                    2,
-                )
-                if total
-                else 0,
-                round(
-                    (
-                        len(set(contact["key"]).symmetric_difference(set(sf["key"])))
-                        / total
-                    )
-                    * 100,
-                    2,
-                )
-                if total
-                else 0,
-            ],
-        }
-    )
-
-    return merged, marketing_summary
+    out = io.BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return out
 
 
 # ── Core Logic ────────────────────────────────────
 
 
-def run_extraction(
-    contact_files,
-    sf_files,
-    use_phone,
-    use_email,
-    use_name,
-    filter_campaign,
-    filter_adgroup,
-    mode,
-    direction,
-    log,
-):
-    if not contact_files:
-        raise Exception("Please upload Contact file(s)")
+def run_extraction(contact_files, sf_file, log):
+    log("Loading Contact Us files...")
 
-    if not sf_files:
-        raise Exception("Please upload Salesforce file(s)")
+    contact_dfs = []
 
-    log("Loading Contact files...")
-    contact = pd.concat([read_file(f) for f in contact_files], ignore_index=True)
-    contact["Source"] = "Contact"
+    for f in contact_files:
+        log(f"  → {f.name}")
 
-    log("Loading Salesforce files...")
-    sf = pd.concat([read_file(f) for f in sf_files], ignore_index=True)
-    sf["Source"] = "Salesforce"
+        try:
+            df = read_any(f)
+        except Exception as e:
+            log(f"❌ Failed to read file: {e}")
+            continue
 
-    # Normalize
-    if use_phone:
-        contact["_phone"] = contact["Phone"].apply(normalize_phone)
-        sf["_phone"] = sf["Phone"].apply(normalize_phone)
+        if df.empty:
+            log(f"⚠ {f.name} is empty")
+            continue
 
-    if use_email:
-        contact["_email"] = contact["Email"].apply(normalize_email)
-        sf["_email"] = sf["Email"].apply(normalize_email)
+        df.columns = df.columns.str.strip()
 
-    if use_name:
-        contact["_name"] = contact.apply(
-            lambda x: normalize_name(x.get("First Name", ""), x.get("Last Name", "")),
-            axis=1,
-        )
-        sf["_name"] = sf.apply(
-            lambda x: normalize_name(x.get("First Name", ""), x.get("Last Name", "")),
-            axis=1,
-        )
+        phone_col = find_column(df, PHONE_ALIASES)
+        email_col = find_column(df, EMAIL_ALIASES)
 
-    # Deduplication
-    contact = deduplicate(contact, use_phone, use_email, use_name)
-    sf = deduplicate(sf, use_phone, use_email, use_name)
+        if not phone_col and not email_col:
+            log(f"❌ Skipping {f.name}: No Phone or Email column found")
+            continue
 
-    log(f"After dedup → Contact: {len(contact)}, SF: {len(sf)}")
+        df["_phone_norm"] = df[phone_col].apply(normalize_phone) if phone_col else None
+        df["_email_norm"] = df[email_col].apply(normalize_email) if email_col else None
 
-    # Build match keys
-    contact["key"] = build_match_keys(contact, use_phone, use_email, use_name)
-    sf["key"] = build_match_keys(sf, use_phone, use_email, use_name)
+        contact_dfs.append(df)
 
-    contact_keys = set(contact["key"])
-    sf_keys = set(sf["key"])
+    if not contact_dfs:
+        raise Exception("No valid Contact files found.")
 
-    # ── Comparison Modes ─────────────────────
+    contact = pd.concat(contact_dfs, ignore_index=True)
+    log(f"✔ Total Contact rows merged: {len(contact):,}")
 
-    if mode == "UNIDIRECTIONAL":
-        if direction == "CONTACT_TO_SF":
-            contact["Match"] = contact["key"].isin(sf_keys)
-            matched = contact[contact["Match"]]
-            excluded = contact[~contact["Match"]]
-        else:
-            sf["Match"] = sf["key"].isin(contact_keys)
-            matched = sf[sf["Match"]]
-            excluded = sf[~sf["Match"]]
+    # ── Load Salesforce File ─────────────────────────────
 
-    else:  # BIDIRECTIONAL
-        contact["Match"] = contact["key"].isin(sf_keys)
-        sf["Match"] = sf["key"].isin(contact_keys)
-
-        contact_missing = contact[~contact["Match"]].copy()
-        contact_missing["Missing From"] = "Salesforce"
-
-        sf_missing = sf[~sf["Match"]].copy()
-        sf_missing["Missing From"] = "Contact"
-
-        matched = pd.concat([contact[contact["Match"]], sf[sf["Match"]]])
-        excluded = pd.concat([contact_missing, sf_missing])
-
-    # ── Optional Marketing Filters ─────────────────
-
-    for col in ["Campaign ID", "AdGroup ID"]:
-        if col not in contact:
-            contact[col] = ""
-        if col not in sf:
-            sf[col] = ""
-
-        contact[col] = contact[col].fillna("").astype(str).str.strip()
-        sf[col] = sf[col].fillna("").astype(str).str.strip()
-
-    if filter_campaign:
-        contact_campaigns = set(contact["Campaign ID"][contact["Campaign ID"] != ""])
-        sf_campaigns = set(sf["Campaign ID"][sf["Campaign ID"] != ""])
-
-        if direction == "SF_TO_CONTACT" or mode == "BIDIRECTIONAL":
-            sf_missing_campaign = sf[
-                (~sf["Campaign ID"].isin(contact_campaigns)) & (sf["Campaign ID"] != "")
-            ].copy()
-            sf_missing_campaign["Exclusion Reason"] = "Campaign ID Missing in Contact"
-            excluded = pd.concat([excluded, sf_missing_campaign], ignore_index=True)
-
-        if direction == "CONTACT_TO_SF" or mode == "BIDIRECTIONAL":
-            contact_missing_campaign = contact[
-                (~contact["Campaign ID"].isin(sf_campaigns)) & (contact["Campaign ID"] != "")
-            ].copy()
-            contact_missing_campaign["Exclusion Reason"] = "Campaign ID Missing in SF"
-            excluded = pd.concat([excluded, contact_missing_campaign], ignore_index=True)
-
-    if filter_adgroup:
-        contact_adgroups = set(contact["AdGroup ID"][contact["AdGroup ID"] != ""])
-        sf_adgroups = set(sf["AdGroup ID"][sf["AdGroup ID"] != ""])
-
-        if direction == "SF_TO_CONTACT" or mode == "BIDIRECTIONAL":
-            sf_missing_adgroup = sf[
-                (~sf["AdGroup ID"].isin(contact_adgroups)) & (sf["AdGroup ID"] != "")
-            ].copy()
-            sf_missing_adgroup["Exclusion Reason"] = "AdGroup ID Missing in Contact"
-            excluded = pd.concat([excluded, sf_missing_adgroup], ignore_index=True)
-
-        if direction == "CONTACT_TO_SF" or mode == "BIDIRECTIONAL":
-            contact_missing_adgroup = contact[
-                (~contact["AdGroup ID"].isin(sf_adgroups)) & (contact["AdGroup ID"] != "")
-            ].copy()
-            contact_missing_adgroup["Exclusion Reason"] = "AdGroup ID Missing in SF"
-            excluded = pd.concat([excluded, contact_missing_adgroup], ignore_index=True)
-
-    excluded = excluded.drop_duplicates(subset=["key"])
-
-    campaign_detail_df, marketing_df = marketing_analysis(
-        contact, sf, mode, direction, matched, excluded
-    )
-
-    # ── Summary ─────────────────────────────
-
-    contact_rows = len(contact)
-    sf_rows = len(sf)
-    total_physical_rows = contact_rows + sf_rows
-
-    unique_total_keys = len(set(contact["key"]).union(set(sf["key"])))
-    unique_matched_keys = len(set(contact["key"]).intersection(set(sf["key"])))
-    unique_excluded_keys = unique_total_keys - unique_matched_keys
-
-    contact_matched_rows = contact["Match"].sum() if "Match" in contact else 0
-    sf_matched_rows = sf["Match"].sum() if "Match" in sf else 0
-    total_matched_rows = contact_matched_rows + sf_matched_rows
-
-    summary = pd.DataFrame(
-        {
-            "Metric": [
-                "Mode",
-                "Direction",
-                "Contact Rows",
-                "SF Rows",
-                "Total Physical Rows",
-                "Unique Combined Keys",
-                "Unique Matched Keys",
-                "Unique Excluded Keys",
-                "Contact Matched Rows",
-                "SF Matched Rows",
-                "Total Matched Rows",
-                "Unique Match %",
-                "Unique Missing %",
-            ],
-            "Value": [
-                mode,
-                direction if mode == "UNIDIRECTIONAL" else "Two-Way Comparison",
-                contact_rows,
-                sf_rows,
-                total_physical_rows,
-                unique_total_keys,
-                unique_matched_keys,
-                unique_excluded_keys,
-                contact_matched_rows,
-                sf_matched_rows,
-                total_matched_rows,
-                round((unique_matched_keys / unique_total_keys) * 100, 2)
-                if unique_total_keys
-                else 0,
-                round((unique_excluded_keys / unique_total_keys) * 100, 2)
-                if unique_total_keys
-                else 0,
-            ],
-        }
-    )
-
-    # ── Build Excel in memory ─────────────────────────
-
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        contact.to_excel(writer, sheet_name="Contact Data", index=False)
-        sf.to_excel(writer, sheet_name="SF Data", index=False)
-        matched.to_excel(writer, sheet_name="Matched", index=False)
-        excluded.to_excel(writer, sheet_name="Excluded", index=False)
-        summary.to_excel(writer, sheet_name="Summary", index=False)
-        campaign_detail_df.to_excel(writer, sheet_name="Campaign Comparison", index=False)
-        marketing_df.to_excel(writer, sheet_name="Marketing Summary", index=False)
-    buffer.seek(0)
-
-    log("══════════════════════════════")
-    log(f"MODE: {mode}")
-
-    matching_used = []
-    if use_phone:
-        matching_used.append("Phone")
-    if use_email:
-        matching_used.append("Email")
-    if use_name:
-        matching_used.append("Name")
-
-    log(f"Matching Using: {', '.join(matching_used)}")
-    log(f"Contact Records: {len(contact)}")
-    log(f"SF Records: {len(sf)}")
-    log(f"Unique Matched Entities: {unique_matched_keys}")
-    log(f"Unique Excluded Entities: {unique_excluded_keys}")
-    log(f"Matched Rows Sheet Count: {len(matched)}")
-    log(f"Excluded Rows Sheet Count: {len(excluded)}")
+    log("Loading Salesforce file...")
 
     try:
-        campaign_match = (campaign_detail_df["Campaign Status"] == "Match").sum()
-        campaign_missing_sf = (campaign_detail_df["Campaign Status"] == "Missing in SF").sum()
-        campaign_missing_contact = (
-            campaign_detail_df["Campaign Status"] == "Missing in Contact"
-        ).sum()
+        sf = read_any(sf_file)
+    except Exception as e:
+        raise Exception(f"Failed to read Salesforce file: {e}")
 
-        log(f"Campaign Matches: {campaign_match}")
-        log(f"Campaign Missing in SF: {campaign_missing_sf}")
-        log(f"Campaign Missing in Contact: {campaign_missing_contact}")
-    except Exception:
-        pass
+    sf.columns = sf.columns.str.strip()
 
-    log("Output Ready")
-    log("══════════════════════════════")
+    sf_phone_col = find_column(sf, PHONE_ALIASES)
+    sf_email_col = find_column(sf, EMAIL_ALIASES)
+
+    if not sf_phone_col and not sf_email_col:
+        raise Exception("No Phone or Email column found in Salesforce file")
+
+    log(f"✔ Salesforce rows loaded: {len(sf):,}")
+
+    sf["_phone_norm"] = sf[sf_phone_col].apply(normalize_phone) if sf_phone_col else None
+    sf["_email_norm"] = sf[sf_email_col].apply(normalize_email) if sf_email_col else None
+
+    # Remove invalid rows
+    contact = contact[contact["_phone_norm"].notna() | contact["_email_norm"].notna()]
+    sf = sf[sf["_phone_norm"].notna() | sf["_email_norm"].notna()]
+
+    # Remove duplicates
+    contact = contact.drop_duplicates(subset=["_phone_norm", "_email_norm"])
+    sf = sf.drop_duplicates(subset=["_phone_norm", "_email_norm"])
+
+    sf_phones = set(sf["_phone_norm"].dropna())
+    sf_emails = set(sf["_email_norm"].dropna())
+
+    log(f"✔ Unique SF phones : {len(sf_phones):,}")
+    log(f"✔ Unique SF emails : {len(sf_emails):,}")
+
+    # ── Matching Logic ─────────────────────────────────
+
+    log("Comparing Contact data against Salesforce...")
+
+    email_exists = contact["_email_norm"].notna()
+    email_match = contact["_email_norm"].isin(sf_emails)
+    phone_match = contact["_phone_norm"].isin(sf_phones)
+
+    # If email exists -> ONLY email comparison. Else -> fallback to phone.
+    matched_mask = (email_exists & email_match) | (~email_exists & phone_match)
+
+    matched = contact[matched_mask].copy()
+    excluded = contact[~matched_mask].copy()
+
+    matched_count = int(matched_mask.sum())
+
+    helper_cols = ["_phone_norm", "_email_norm"]
+    matched.drop(columns=helper_cols, inplace=True, errors="ignore")
+    excluded.drop(columns=helper_cols, inplace=True, errors="ignore")
+
+    log("\nResults:")
+    log(f"  Total Contact rows : {len(contact):,}")
+    log(f"  Matched rows       : {matched_count:,}")
+    log(f"  Excluded rows      : {len(excluded):,}")
 
     return {
-        "buffer": buffer,
-        "summary": summary,
+        "contact_total": len(contact),
         "matched": matched,
         "excluded": excluded,
-        "unique_matched_keys": unique_matched_keys,
-        "unique_excluded_keys": unique_excluded_keys,
+        "matched_count": matched_count,
+        "excluded_count": len(excluded),
     }
 
 
 # ── Streamlit UI ────────────────────────────────────
 
-st.set_page_config(page_title="Data Comparison Tool", page_icon="📊", layout="wide")
+st.set_page_config(page_title="Excluded Contacts Extractor", page_icon="📇", layout="wide")
 
-st.title("📊 Data Comparison Tool")
-st.caption("Compare Contact files against Salesforce data by Phone, Email, and/or Name.")
+st.title("📇 Excluded Contacts Extractor")
+st.caption(
+    "Find Contact Us entries not present in Salesforce. "
+    "A contact is matched if its Email is found in Salesforce, "
+    "or — when no email is given — if its Phone is found instead."
+)
 
 col1, col2 = st.columns(2)
 
 with col1:
     st.subheader("📂 Contact Files")
     contact_files = st.file_uploader(
-        "Upload Contact file(s)",
+        "Upload Contact Us file(s)",
         type=["csv", "xlsx", "xls"],
         accept_multiple_files=True,
         key="contact_files",
     )
 
 with col2:
-    st.subheader("📂 Salesforce Files")
-    sf_files = st.file_uploader(
-        "Upload Salesforce file(s)",
+    st.subheader("📂 Salesforce File")
+    sf_file = st.file_uploader(
+        "Upload Salesforce file",
         type=["csv", "xlsx", "xls"],
-        accept_multiple_files=True,
-        key="sf_files",
+        accept_multiple_files=False,
+        key="sf_file",
     )
 
-st.subheader("⚙️ Matching Options")
-m1, m2, m3 = st.columns(3)
-use_phone = m1.checkbox("Phone", value=True)
-use_email = m2.checkbox("Email", value=True)
-use_name = m3.checkbox("Name", value=False)
-
-st.subheader("📢 Marketing Filters")
-f1, f2 = st.columns(2)
-filter_campaign = f1.checkbox("Exclude Missing Campaign IDs", value=False)
-filter_adgroup = f2.checkbox("Exclude Missing AdGroup IDs", value=False)
-
-st.subheader("🔄 Comparison Mode")
-mode_label = st.radio("Mode", ["Unidirectional", "Bidirectional"], horizontal=True)
-mode = "UNIDIRECTIONAL" if mode_label == "Unidirectional" else "BIDIRECTIONAL"
-
-direction = "CONTACT_TO_SF"
-if mode == "UNIDIRECTIONAL":
-    direction_label = st.radio(
-        "Direction", ["Contact → SF", "SF → Contact"], horizontal=True
+with st.expander("⚙️ Options"):
+    include_matched = st.checkbox(
+        "Include a 'Matched Contacts' sheet in the download",
+        value=False,
+        help="The original tool only exported Excluded Contacts. "
+        "Turn this on to also get a sheet of the rows that matched Salesforce.",
     )
-    direction = "CONTACT_TO_SF" if direction_label == "Contact → SF" else "SF_TO_CONTACT"
 
-run_clicked = st.button("🚀 Run Comparison", type="primary")
+run_clicked = st.button("▶ Run Extraction", type="primary")
 
 if run_clicked:
     logs = []
@@ -526,45 +270,59 @@ if run_clicked:
     def log(msg):
         logs.append(msg)
 
-    try:
-        with st.spinner("Running comparison..."):
-            result = run_extraction(
-                contact_files,
-                sf_files,
-                use_phone,
-                use_email,
-                use_name,
-                filter_campaign,
-                filter_adgroup,
-                mode,
-                direction,
-                log,
-            )
-    except Exception as e:
-        st.error(f"❌ {e}")
-        if logs:
+    if not contact_files:
+        st.warning("Please upload at least one Contact file.")
+    elif not sf_file:
+        st.warning("Please upload a Salesforce file.")
+    else:
+        try:
+            with st.spinner("Running extraction..."):
+                result = run_extraction(contact_files, sf_file, log)
+        except Exception as e:
+            st.error(f"❌ {e}")
             with st.expander("Log"):
                 st.text("\n".join(logs))
-    else:
-        st.success("Comparison complete!")
+        else:
+            st.success("Extraction complete!")
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Unique Matched", result["unique_matched_keys"])
-        c2.metric("Unique Excluded", result["unique_excluded_keys"])
-        c3.metric("Excluded Rows", len(result["excluded"]))
+            total = result["contact_total"]
+            matched_pct = round((result["matched_count"] / total) * 100, 2) if total else 0
 
-        st.subheader("Summary")
-        st.dataframe(result["summary"], use_container_width=True, hide_index=True)
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Total Contact Rows", total)
+            c2.metric("Matched", result["matched_count"])
+            c3.metric("Excluded", result["excluded_count"])
+            c4.metric("Match Rate", f"{matched_pct}%")
 
-        st.download_button(
-            label="💾 Download Full Report (Excel)",
-            data=result["buffer"],
-            file_name="comparison_output.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+            sheets = {"Excluded Contacts": result["excluded"]}
+            if include_matched:
+                sheets["Matched Contacts"] = result["matched"]
 
-        with st.expander("Log"):
-            st.text("\n".join(logs))
+            raw_buffer = io.BytesIO()
+            with pd.ExcelWriter(raw_buffer, engine="openpyxl") as writer:
+                for sheet_name, df in sheets.items():
+                    df.to_excel(writer, index=False, sheet_name=sheet_name)
 
-        with st.expander("Preview: Excluded (first 100 rows)"):
-            st.dataframe(result["excluded"].head(100), use_container_width=True)
+            styled_buffer = style_workbook(raw_buffer)
+
+            st.download_button(
+                label="💾 Download Excel Report",
+                data=styled_buffer,
+                file_name="excluded_contacts.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+            tabs = st.tabs(["Excluded", "Matched", "Log"] if include_matched else ["Excluded", "Log"])
+
+            with tabs[0]:
+                st.dataframe(result["excluded"].head(200), use_container_width=True)
+
+            if include_matched:
+                with tabs[1]:
+                    st.dataframe(result["matched"].head(200), use_container_width=True)
+                log_tab = tabs[2]
+            else:
+                log_tab = tabs[1]
+
+            with log_tab:
+                st.text("\n".join(logs))
