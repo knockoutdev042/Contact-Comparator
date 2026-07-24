@@ -3,3 +3,7 @@ headless = true
 
 [browser]
 gatherUsageStats = false
+
+[theme]
+primaryColor = "#e94560"
+
