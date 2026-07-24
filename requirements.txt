@@ -1,0 +1,6 @@
+
+xlrd
+pandas
+openpyxl
+tkinter
+pyinstaller

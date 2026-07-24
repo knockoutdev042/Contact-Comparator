@@ -1,0 +1,10 @@
+venv/ or .venv/
+.env
+__pycache__/
+dist/
+build/
+.vscode/
+.idea/
+*.log
+*.spec
+.streamlit/secrets.toml
